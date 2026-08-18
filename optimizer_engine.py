@@ -4,7 +4,7 @@ Mixed-Integer Linear Programming (MILP) Solver using PuLP.
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Any
 import numpy as np
 import pandas as pd
 import pulp
@@ -14,12 +14,15 @@ import pulp
 class OptimizationResult:
     status: str
     is_optimal: bool
-    total_cost_kphp: float
+    total_cost_kphp: float          # total cost in thousands PHP
     total_demand_mwh: float
     blended_rate_php_kwh: float
     spot_energy_mwh: float
     spot_cost_kphp: float
     spot_share_pct: float
+    generator_energy_mwh: float
+    generator_cost_kphp: float
+    generator_rate_php_kwh: float
     dispatch_df: pd.DataFrame
     hourly_cost_df: pd.DataFrame
     generator_metrics_df: pd.DataFrame
@@ -57,16 +60,13 @@ class DispatchOptimizer:
 
     def _preprocess_data(self):
         """Clean and normalize input datasets."""
-        # Ensure correct column formats
-        if "Date" in self.demand_df.columns:
-            self.demand_df["Date"] = pd.to_datetime(self.demand_df["Date"]).dt.strftime("%Y-%m-%d")
-        if "Date" in self.spot_df.columns:
-            self.spot_df["Date"] = pd.to_datetime(self.spot_df["Date"]).dt.strftime("%Y-%m-%d")
+        for df in [self.demand_df, self.spot_df]:
+            if "Date" in df.columns:
+                df["Date"] = pd.to_datetime(df["Date"]).dt.strftime("%Y-%m-%d")
+            if "Hour" in df.columns:
+                df["Hour"] = df["Hour"].astype(int)
 
-        self.demand_df["Hour"] = self.demand_df["Hour"].astype(int)
-        self.spot_df["Hour"] = self.spot_df["Hour"].astype(int)
-
-        # Build index lookups
+        # Build generator lookup
         self.gen_dict = {}
         for row in self.generators_df.itertuples():
             gen_name = str(row.Generator).strip()
@@ -144,24 +144,23 @@ class DispatchOptimizer:
                 "IsOutage": is_out,
             }
 
+        # DG1 + DG2 are treated as ONE diesel-generator power plant.
+        dg_plant_price = active_gens.get("DG1", {}).get("Price", 0.0)
+        if not np.isfinite(dg_plant_price) or dg_plant_price <= 0:
+            dg_plant_price = active_gens.get("DG2", {}).get("Price", 0.0)
+        if not np.isfinite(dg_plant_price):
+            dg_plant_price = 0.0
+
         # Initialize PuLP Problem
         model = pulp.LpProblem("CAPELCO_Optimal_Dispatch", pulp.LpMinimize)
 
         # -----------------------------
         # Decision Variables
         # -----------------------------
-        # GCGI: Baseload must-run (15 MW nominal or specified capacity if not on outage)
         gcgi_cap = active_gens.get("GCGI", {}).get("Capacity", 15.0)
-        
-        # FDC: Fixed 4 MW (or min(4, cap) if derated/outage)
         fdc_cap = min(4.0, active_gens.get("FDC", {}).get("Capacity", 4.0))
 
-        # PEDC: Discrete 4 MW or 8 MW (4 + 4*u_pedc)
-        # If cap < 8 MW, adjust accordingly
         u_pedc = pulp.LpVariable.dicts("u_PEDC", all_keys, cat=pulp.LpBinary)
-        
-        # SPI: Whole-number MW nominations [0, cap].
-        # Integer MW is enforced in the MILP itself; do not round after solving.
         spi_cap = active_gens.get("SPI", {}).get("Capacity", 8.0)
         disp_spi = pulp.LpVariable.dicts(
             "disp_SPI",
@@ -171,53 +170,29 @@ class DispatchOptimizer:
             cat=pulp.LpInteger,
         )
 
-        # DG1 & DG2: Discrete Peakers (0 or Capacity)
         dg1_cap = active_gens.get("DG1", {}).get("Capacity", 3.1)
         u_dg1 = pulp.LpVariable.dicts("u_DG1", all_keys, cat=pulp.LpBinary)
-
         dg2_cap = active_gens.get("DG2", {}).get("Capacity", 3.8)
         u_dg2 = pulp.LpVariable.dicts("u_DG2", all_keys, cat=pulp.LpBinary)
 
-        # GCGI/FDC are fixed whole-MW commitments (15 MW / 4 MW in the
-        # standard data); PEDC is already discrete at 4 or 8 MW.
-        # SPI is explicitly integer above.
-        #
-        # DG1/DG2 remain binary 0-or-full because their supplied physical
-        # capacities are fractional (3.1 and 3.8 MW). Forcing those exact
-        # capacities to integers would change the physical contract.
-        #
-        # Spot Market: Continuous [0, inf)
         disp_spot = pulp.LpVariable.dicts("disp_Spot", all_keys, lowBound=0)
-
-        # Unserved Energy Penalty / Slack (to guarantee feasibility & diagnostic info if demand exceeds all resources)
         unserved = pulp.LpVariable.dicts("unserved", all_keys, lowBound=0)
-        PENALTY_UNSERVED = 1000.0  # PHP/kWh VOLL (Value of Lost Load)
+        PENALTY_UNSERVED = 1000.0  # PHP/MWh
 
-        # Helper for PEDC hourly output
         pedc_base = 4.0 if active_gens.get("PEDC", {}).get("Capacity", 8.0) >= 4.0 else 0.0
         pedc_step = max(0.0, active_gens.get("PEDC", {}).get("Capacity", 8.0) - pedc_base)
 
         # -----------------------------
-        # Objective Function
-        # Total generation procurement cost (kPHP or PHP, consistent across all hours)
+        # Objective Function (cost in PHP)
         # -----------------------------
         model += (
             pulp.lpSum([
-                # GCGI Fixed
                 gcgi_cap * active_gens.get("GCGI", {}).get("Price", 0) +
-                # FDC Fixed
                 fdc_cap * active_gens.get("FDC", {}).get("Price", 0) +
-                # PEDC (4 + 4*u)
                 (pedc_base + pedc_step * u_pedc[(d, h)]) * active_gens.get("PEDC", {}).get("Price", 0) +
-                # SPI
                 disp_spi[(d, h)] * active_gens.get("SPI", {}).get("Price", 0) +
-                # DG1
-                (dg1_cap * u_dg1[(d, h)]) * active_gens.get("DG1", {}).get("Price", 0) +
-                # DG2
-                (dg2_cap * u_dg2[(d, h)]) * active_gens.get("DG2", {}).get("Price", 0) +
-                # Spot Market
+                (dg1_cap * u_dg1[(d, h)] + dg2_cap * u_dg2[(d, h)]) * dg_plant_price +
                 disp_spot[(d, h)] * spot_price[(d, h)] +
-                # Unserved slack
                 unserved[(d, h)] * PENALTY_UNSERVED
                 for (d, h) in all_keys
             ]),
@@ -231,8 +206,7 @@ class DispatchOptimizer:
             d_hours = hours_by_date[d]
             num_h = len(d_hours)
 
-            # 1. Daily Minimum Energy / CUF Contractual Commitments
-            # PEDC: 8 MW * 24h * 0.8 = 153.6 MWh (scaled by available capacity)
+            # PEDC daily minimum energy
             if not active_gens.get("PEDC", {}).get("IsOutage", False) and pedc_step > 0:
                 pedc_min_daily = min(153.6 * (num_h / 24.0), active_gens["PEDC"]["Capacity"] * num_h * 0.8)
                 model += (
@@ -240,7 +214,7 @@ class DispatchOptimizer:
                     f"PEDC_Daily_Min_Energy_{d}"
                 )
 
-            # SPI: 144 MWh/day minimum contractual energy
+            # SPI daily minimum energy
             if not active_gens.get("SPI", {}).get("IsOutage", False) and spi_cap > 0:
                 spi_min_daily = min(144.0 * (num_h / 24.0), spi_cap * num_h * 0.75)
                 model += (
@@ -248,15 +222,15 @@ class DispatchOptimizer:
                     f"SPI_Daily_Min_Energy_{d}"
                 )
 
-            # 2. Hourly Load Balance Constraint
+            # Hourly load balance
             for h in d_hours:
                 model += (
                     gcgi_cap +
                     fdc_cap +
                     (pedc_base + pedc_step * u_pedc[(d, h)]) +
                     disp_spi[(d, h)] +
-                    (dg1_cap * u_dg1[(d, h)]) +
-                    (dg2_cap * u_dg2[(d, h)]) +
+                    dg1_cap * u_dg1[(d, h)] +
+                    dg2_cap * u_dg2[(d, h)] +
                     disp_spot[(d, h)] +
                     unserved[(d, h)] == demand[(d, h)],
                     f"Demand_Balance_{d}_{h}"
@@ -285,7 +259,7 @@ class DispatchOptimizer:
             unserved_gen = unserved[(d, h)].varValue or 0.0
 
             # Power MW
-            disp_row = {
+            dispatch_records.append({
                 "Date": d,
                 "Hour": h,
                 "Demand_MW": demand[(d, h)],
@@ -297,63 +271,73 @@ class DispatchOptimizer:
                 "DG2_MW": dg2_gen,
                 "Spot_MW": spot_gen,
                 "Unserved_MW": unserved_gen,
-            }
-            dispatch_records.append(disp_row)
+            })
 
-            # Costs (kPHP)
+            # Costs (PHP)
             gcgi_c = gcgi_cap * active_gens.get("GCGI", {}).get("Price", 0)
             fdc_c = fdc_cap * active_gens.get("FDC", {}).get("Price", 0)
             pedc_c = pedc_gen * active_gens.get("PEDC", {}).get("Price", 0)
             spi_c = spi_gen * active_gens.get("SPI", {}).get("Price", 0)
-            dg1_c = dg1_gen * active_gens.get("DG1", {}).get("Price", 0)
-            dg2_c = dg2_gen * active_gens.get("DG2", {}).get("Price", 0)
+            dg_plant_mw = dg1_gen + dg2_gen
+            dg_plant_c = dg_plant_mw * dg_plant_price
             spot_c = spot_gen * spot_price[(d, h)]
-            tot_c = gcgi_c + fdc_c + pedc_c + spi_c + dg1_c + dg2_c + spot_c
+            tot_c = gcgi_c + fdc_c + pedc_c + spi_c + dg_plant_c + spot_c
 
-            cost_row = {
+            cost_records.append({
                 "Date": d,
                 "Hour": h,
                 "GCGI_Cost": gcgi_c,
                 "FDC_Cost": fdc_c,
                 "PEDC_Cost": pedc_c,
                 "SPI_Cost": spi_c,
-                "DG1_Cost": dg1_c,
-                "DG2_Cost": dg2_c,
+                "DG_Plant_MW": dg_plant_mw,
+                "DG_Plant_Cost": dg_plant_c,
+                "DG1_Cost": 0.0,
+                "DG2_Cost": 0.0,
                 "Spot_Cost": spot_c,
-                "Total_Cost_kPHP": tot_c,
+                "Total_Cost_PHP": tot_c,          # store in PHP
                 "Blended_Rate_PHP_kWh": tot_c / demand[(d, h)] if demand[(d, h)] > 0 else 0,
-            }
-            cost_records.append(cost_row)
+            })
 
         dispatch_df = pd.DataFrame(dispatch_records)
         cost_df = pd.DataFrame(cost_records)
+        dispatch_df["DG_Plant_MW"] = dispatch_df["DG1_MW"] + dispatch_df["DG2_MW"]
 
-        # Summary KPIs
+        # Summary KPIs (convert to kPHP)
         total_demand = dispatch_df["Demand_MW"].sum()
-        total_cost = cost_df["Total_Cost_kPHP"].sum()
-        blended_rate = total_cost / total_demand if total_demand > 0 else 0.0
+        total_cost_php = cost_df["Total_Cost_PHP"].sum()
+        total_cost_kphp = total_cost_php / 1000.0
+        blended_rate = total_cost_php / total_demand if total_demand > 0 else 0.0
         spot_energy = dispatch_df["Spot_MW"].sum()
-        spot_cost = cost_df["Spot_Cost"].sum()
+        spot_cost_php = cost_df["Spot_Cost"].sum()
+        spot_cost_kphp = spot_cost_php / 1000.0
         spot_share = (spot_energy / total_demand * 100) if total_demand > 0 else 0.0
 
-        # Generator Performance Metrics Table
+        # Generator Performance Metrics
         gen_metrics = []
+        physical_gcgi_cap = self.gen_dict.get("GCGI", {}).get("Capacity", 15.0)
+        physical_fdc_cap = self.gen_dict.get("FDC", {}).get("Capacity", 8.0)
+        physical_pedc_cap = self.gen_dict.get("PEDC", {}).get("Capacity", 8.0)
+        physical_spi_cap = self.gen_dict.get("SPI", {}).get("Capacity", 8.0)
+        physical_dg1_cap = self.gen_dict.get("DG1", {}).get("Capacity", 3.1)
+        physical_dg2_cap = self.gen_dict.get("DG2", {}).get("Capacity", 3.8)
+        physical_dg_plant_cap = physical_dg1_cap + physical_dg2_cap
+
         gen_cols = [
-            ("GCGI", "GCGI_MW", "GCGI_Cost", active_gens.get("GCGI", {}).get("Capacity", 15.0), active_gens.get("GCGI", {}).get("Price", 0)),
-            ("FDC", "FDC_MW", "FDC_Cost", active_gens.get("FDC", {}).get("Capacity", 8.0), active_gens.get("FDC", {}).get("Price", 0)),
-            ("PEDC", "PEDC_MW", "PEDC_Cost", active_gens.get("PEDC", {}).get("Capacity", 8.0), active_gens.get("PEDC", {}).get("Price", 0)),
-            ("SPI", "SPI_MW", "SPI_Cost", active_gens.get("SPI", {}).get("Capacity", 8.0), active_gens.get("SPI", {}).get("Price", 0)),
-            ("DG1", "DG1_MW", "DG1_Cost", active_gens.get("DG1", {}).get("Capacity", 3.1), active_gens.get("DG1", {}).get("Price", 0)),
-            ("DG2", "DG2_MW", "DG2_Cost", active_gens.get("DG2", {}).get("Capacity", 3.8), active_gens.get("DG2", {}).get("Price", 0)),
+            ("GCGI", "GCGI_MW", "GCGI_Cost", physical_gcgi_cap, self.gen_dict.get("GCGI", {}).get("Price", 0)),
+            ("FDC", "FDC_MW", "FDC_Cost", physical_fdc_cap, self.gen_dict.get("FDC", {}).get("Price", 0)),
+            ("PEDC", "PEDC_MW", "PEDC_Cost", physical_pedc_cap, self.gen_dict.get("PEDC", {}).get("Price", 0)),
+            ("SPI", "SPI_MW", "SPI_Cost", physical_spi_cap, self.gen_dict.get("SPI", {}).get("Price", 0)),
+            ("DG Plant (DG1+DG2)", "DG_Plant_MW", "DG_Plant_Cost", physical_dg_plant_cap, dg_plant_price),
             ("Spot Market", "Spot_MW", "Spot_Cost", 999.0, self.spot_df["SpotPrice"].mean()),
         ]
 
         total_hours = len(dispatch_df)
         for name, col_mw, col_cost, cap, base_price in gen_cols:
             tot_mwh = dispatch_df[col_mw].sum()
-            tot_kphp = cost_df[col_cost].sum()
+            tot_kphp = cost_df[col_cost].sum() / 1000.0   # convert to kPHP
             share_pct = (tot_mwh / total_demand * 100) if total_demand > 0 else 0.0
-            avg_rate = (tot_kphp / tot_mwh) if tot_mwh > 0 else base_price
+            avg_rate = (tot_kphp * 1000 / tot_mwh) if tot_mwh > 0 else base_price
             cuf_pct = (tot_mwh / (cap * total_hours) * 100) if (0 < cap < 900) and total_hours > 0 else np.nan
 
             gen_metrics.append({
@@ -369,7 +353,16 @@ class DispatchOptimizer:
 
         gen_metrics_df = pd.DataFrame(gen_metrics)
 
-        # Daily summary DataFrame
+        # Generator-only weighted rate (excludes spot)
+        generator_rows = gen_metrics_df[gen_metrics_df["Generator"] != "Spot Market"]
+        generator_energy_mwh = float(generator_rows["Energy Dispatched (MWh)"].sum())
+        generator_cost_kphp = float(generator_rows["Total Cost (kPHP)"].sum())
+        generator_rate_php_kwh = (
+            generator_cost_kphp * 1000 / generator_energy_mwh
+            if generator_energy_mwh > 0 else 0.0
+        )
+
+        # Daily summary
         daily_summary = dispatch_df.groupby("Date").agg({
             "Demand_MW": "sum",
             "GCGI_MW": "sum",
@@ -381,22 +374,18 @@ class DispatchOptimizer:
             "Spot_MW": "sum",
         }).reset_index()
 
-        daily_costs = cost_df.groupby("Date")["Total_Cost_kPHP"].sum().reset_index()
-        daily_summary = pd.merge(daily_summary, daily_costs, on="Date")
-        daily_summary["Blended_Rate_PHP_kWh"] = daily_summary["Total_Cost_kPHP"] / daily_summary["Demand_MW"]
+        daily_costs = cost_df.groupby("Date")["Total_Cost_PHP"].sum().reset_index()
+        daily_costs["Total_Cost_kPHP"] = daily_costs["Total_Cost_PHP"] / 1000.0
+        daily_summary = pd.merge(daily_summary, daily_costs[["Date", "Total_Cost_kPHP"]], on="Date")
+        daily_summary["Blended_Rate_PHP_kWh"] = daily_summary["Total_Cost_kPHP"] * 1000 / daily_summary["Demand_MW"]
 
-        # ---------------------------------------------------------
-        # Daily Generator Constraint Verification
-        # ---------------------------------------------------------
-        # This table reports the actual daily total for every resource
-        # against the contractual/physical requirement used by the MILP.
+        # Constraint verification (using the optimizer's internal logic)
         constraint_rows = []
-
         for d in dates:
             d_hours = hours_by_date[d]
             num_h = len(d_hours)
 
-            # GCGI: must run at available capacity every hour.
+            # GCGI
             gcgi_actual = dispatch_df.loc[dispatch_df["Date"] == d, "GCGI_MW"].sum()
             gcgi_expected = gcgi_cap * num_h
             constraint_rows.append({
@@ -409,7 +398,7 @@ class DispatchOptimizer:
                 "Status": "PASS" if abs(gcgi_actual - gcgi_expected) <= 1e-6 else "FAIL",
             })
 
-            # FDC: fixed 4 MW (or derated available capacity) every hour.
+            # FDC
             fdc_actual = dispatch_df.loc[dispatch_df["Date"] == d, "FDC_MW"].sum()
             fdc_expected = fdc_cap * num_h
             constraint_rows.append({
@@ -422,14 +411,11 @@ class DispatchOptimizer:
                 "Status": "PASS" if abs(fdc_actual - fdc_expected) <= 1e-6 else "FAIL",
             })
 
-            # PEDC: each hour is 4 or 8 MW, with the daily minimum.
+            # PEDC
             pedc_actual = dispatch_df.loc[dispatch_df["Date"] == d, "PEDC_MW"].sum()
             pedc_min = 0.0
             if not active_gens.get("PEDC", {}).get("IsOutage", False) and pedc_step > 0:
-                pedc_min = min(
-                    153.6 * (num_h / 24.0),
-                    active_gens["PEDC"]["Capacity"] * num_h * 0.8,
-                )
+                pedc_min = min(153.6 * (num_h / 24.0), active_gens["PEDC"]["Capacity"] * num_h * 0.8)
             pedc_max = active_gens.get("PEDC", {}).get("Capacity", 8.0) * num_h
             pedc_hourly = dispatch_df.loc[dispatch_df["Date"] == d, "PEDC_MW"]
             pedc_values_ok = pedc_hourly.apply(
@@ -437,7 +423,6 @@ class DispatchOptimizer:
             ).all() if pedc_hourly.notna().all() else False
             if active_gens.get("PEDC", {}).get("IsOutage", False):
                 pedc_values_ok = (pedc_hourly.abs() <= 1e-6).all()
-
             constraint_rows.append({
                 "Date": d,
                 "Generator": "PEDC",
@@ -448,14 +433,11 @@ class DispatchOptimizer:
                 "Status": "PASS" if pedc_values_ok and pedc_actual + 1e-6 >= pedc_min else "FAIL",
             })
 
-            # SPI: integer MW, 0..capacity, plus daily minimum.
+            # SPI
             spi_actual = dispatch_df.loc[dispatch_df["Date"] == d, "SPI_MW"].sum()
             spi_min = 0.0
             if not active_gens.get("SPI", {}).get("IsOutage", False) and spi_cap > 0:
-                spi_min = min(
-                    144.0 * (num_h / 24.0),
-                    spi_cap * num_h * 0.75,
-                )
+                spi_min = min(144.0 * (num_h / 24.0), spi_cap * num_h * 0.75)
             spi_max = int(np.floor(spi_cap)) * num_h
             spi_hourly = dispatch_df.loc[dispatch_df["Date"] == d, "SPI_MW"]
             spi_integer_ok = spi_hourly.apply(lambda x: abs(x - round(x)) <= 1e-6).all()
@@ -469,7 +451,7 @@ class DispatchOptimizer:
                 "Status": "PASS" if spi_integer_ok and spi_actual + 1e-6 >= spi_min and spi_actual <= spi_max + 1e-6 else "FAIL",
             })
 
-            # DG1/DG2: exact 0-or-full physical capacity.
+            # DG1, DG2
             for dg_name, dg_col, dg_cap in [
                 ("DG1", "DG1_MW", dg1_cap),
                 ("DG2", "DG2_MW", dg2_cap),
@@ -489,7 +471,20 @@ class DispatchOptimizer:
                     "Status": "PASS" if dg_binary_ok else "FAIL",
                 })
 
-            # Spot market: continuous balancing resource; no generator contract.
+            # DG Plant combined
+            dg_plant_actual = dispatch_df.loc[dispatch_df["Date"] == d, "DG_Plant_MW"].sum()
+            dg_plant_max = (dg1_cap + dg2_cap) * num_h
+            constraint_rows.append({
+                "Date": d,
+                "Generator": "DG Plant (DG1+DG2)",
+                "Daily Total (MWh)": dg_plant_actual,
+                "Minimum (MWh)": 0.0,
+                "Maximum (MWh)": dg_plant_max,
+                "Constraint": f"One plant price; units 0/full ({dg1_cap:g}+{dg2_cap:g} MW)",
+                "Status": "PASS" if dg_plant_actual <= dg_plant_max + 1e-6 else "FAIL",
+            })
+
+            # Spot market
             spot_actual = dispatch_df.loc[dispatch_df["Date"] == d, "Spot_MW"].sum()
             constraint_rows.append({
                 "Date": d,
@@ -506,12 +501,15 @@ class DispatchOptimizer:
         return OptimizationResult(
             status=status_str,
             is_optimal=is_optimal,
-            total_cost_kphp=total_cost,
+            total_cost_kphp=total_cost_kphp,
             total_demand_mwh=total_demand,
             blended_rate_php_kwh=blended_rate,
             spot_energy_mwh=spot_energy,
-            spot_cost_kphp=spot_cost,
+            spot_cost_kphp=spot_cost_kphp,
             spot_share_pct=spot_share,
+            generator_energy_mwh=generator_energy_mwh,
+            generator_cost_kphp=generator_cost_kphp,
+            generator_rate_php_kwh=generator_rate_php_kwh,
             dispatch_df=dispatch_df,
             hourly_cost_df=cost_df,
             generator_metrics_df=gen_metrics_df,
@@ -538,9 +536,12 @@ if __name__ == "__main__":
 
     print(f"Solver Status        : {res.status}")
     print(f"Total Energy Demand  : {res.total_demand_mwh:,.2f} MWh")
-    print(f"Total Procurement Cost: PHP {res.total_cost_kphp:,.2f} kPHP")
+    print(f"Total Procurement Cost: PHP {res.total_cost_kphp * 1000:,.2f} (PHP) = {res.total_cost_kphp:,.2f} kPHP")
     print(f"Blended Rate         : PHP {res.blended_rate_php_kwh:.4f} / kWh")
     print(f"Spot Market Energy   : {res.spot_energy_mwh:,.2f} MWh ({res.spot_share_pct:.2f}%)")
+    print(f"Generator-Only Energy: {res.generator_energy_mwh:,.2f} MWh")
+    print(f"Generator-Only Cost  : PHP {res.generator_cost_kphp * 1000:,.2f} (PHP) = {res.generator_cost_kphp:,.2f} kPHP")
+    print(f"Generator-Only Rate  : PHP {res.generator_rate_php_kwh:.4f} / kWh (excluding WESM/Spot)")
     print("\n--- Generator Performance Metrics ---")
     print(res.generator_metrics_df.to_string(index=False))
     print("\n--- Daily Generator Constraint Checks ---")

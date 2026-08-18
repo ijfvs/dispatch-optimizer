@@ -14,7 +14,13 @@ from plotly.subplots import make_subplots
 import streamlit as st
 
 from optimizer_engine import DispatchOptimizer, OptimizationResult
-from forecast_engine import DemandForecaster, PROPHET_AVAILABLE
+
+# Import forecast engine if available, otherwise show error
+try:
+    from forecast_engine import DemandForecaster, PROPHET_AVAILABLE
+except ImportError:
+    DemandForecaster = None
+    PROPHET_AVAILABLE = False
 
 # ---------------------------------------------------------
 # Streamlit Page Configuration & Premium Styling
@@ -59,6 +65,15 @@ st.markdown("""
     button[data-baseweb="tab"][aria-selected="true"] { color:#c084fc !important; border-bottom-color:#a855f7 !important; }
     [data-testid="stFileUploader"] { border:1px dashed #a855f7; border-radius:10px; background:rgba(168,85,247,.04); padding:6px; }
     [data-testid="stDataFrame"] { border:1px solid #2a3040; border-radius:8px; }
+    .metric-card {
+        background: linear-gradient(145deg, #151923, #10131b);
+        border: 1px solid #2a3040;
+        border-radius: 10px;
+        padding: 14px 18px;
+    }
+    .metric-card .metric-title { color: #a1a1aa; font-size: 0.9rem; }
+    .metric-card .metric-value { color: #fafafa; font-size: 1.8rem; font-weight: 600; }
+    .metric-card .metric-sub { color: #71717a; font-size: 0.8rem; margin-top: 4px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -111,66 +126,63 @@ def load_default_data():
 def normalize_hourly_data(df):
     """Standardize Date and Hour columns for reliable merges."""
     df = df.copy()
-
     if "Date" in df.columns:
-        df["Date"] = pd.to_datetime(
-            df["Date"],
-            errors="coerce"
-        ).dt.normalize()
-
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.normalize()
     if "Hour" in df.columns:
-        df["Hour"] = pd.to_numeric(
-            df["Hour"],
-            errors="coerce"
-        ).astype("Int64")
-
+        df["Hour"] = pd.to_numeric(df["Hour"], errors="coerce").astype("Int64")
     return df
 
 
+# Initialize session state
 if "data" not in st.session_state:
     st.session_state["data"] = load_default_data()
 
-st.session_state["data"]["demand"] = normalize_hourly_data(
-    st.session_state["data"]["demand"]
-)
-
-st.session_state["data"]["spot"] = normalize_hourly_data(
-    st.session_state["data"]["spot"]
-)
+st.session_state["data"]["demand"] = normalize_hourly_data(st.session_state["data"]["demand"])
+st.session_state["data"]["spot"] = normalize_hourly_data(st.session_state["data"]["spot"])
 
 if "opt_result" not in st.session_state:
     st.session_state["opt_result"] = None
 
+# Sidebar variables are stored in session state for persistence
+if "outages" not in st.session_state:
+    st.session_state["outages"] = {}
+if "spot_mult" not in st.session_state:
+    st.session_state["spot_mult"] = 1.0
+if "demand_mult" not in st.session_state:
+    st.session_state["demand_mult"] = 1.0
+
 # Color Palette for Generators
 GEN_COLORS = {
-    "GCGI_MW": "#10b981",    # Emerald Green (Geothermal Must-run)
-    "FDC_MW": "#06b6d4",     # Cyan (Fixed Coal)
-    "PEDC_MW": "#3b82f6",    # Blue (Flexible Coal)
-    "SPI_MW": "#8b5cf6",     # Purple (Base/Intermediate)
-    "DG1_MW": "#f59e0b",     # Amber (Diesel Peaker 1)
-    "DG2_MW": "#ea580c",     # Orange (Diesel Peaker 2)
-    "Spot_MW": "#ef4444",    # Crimson Red (WESM Spot Market)
-    "Unserved_MW": "#64748b",# Slate (Unserved)
+    "GCGI_MW": "#10b981",
+    "FDC_MW": "#06b6d4",
+    "PEDC_MW": "#3b82f6",
+    "SPI_MW": "#8b5cf6",
+    "DG1_MW": "#f59e0b",
+    "DG2_MW": "#ea580c",
+    "Spot_MW": "#ef4444",
+    "Unserved_MW": "#64748b",
 }
 
-# ---------------------------------------------------------
-# Sidebar Controls
-# ---------------------------------------------------------
+# =========================================================
+# SIDEBAR
+# =========================================================
 with st.sidebar:
-    st.image("https://img.icons8.com/fluency/96/lightning-bolt.png", width=64)
-    st.title("CAPELCO Optimizer")
+    logo_path = os.path.join(SCRIPT_DIR, "Logo-CAPELCO.png")
+    if os.path.exists(logo_path):
+        st.image(logo_path, width=150)
+    else:
+        st.markdown("### ⚡ CAPELCO")
+    st.markdown("### CAPELCO Optimizer")
     st.caption("Power Supply & Dispatch Management System")
     st.markdown("---")
-
     st.subheader("⚙️ Quick Settings")
-    spot_mult = st.slider("WESM Spot Price Multiplier", 0.5, 3.0, 1.0, 0.1, help="Scale all hourly spot prices")
-    demand_mult = st.slider("Demand Scaling Factor", 0.7, 1.5, 1.0, 0.05, help="Scale hourly demand profile")
+    st.session_state["spot_mult"] = st.slider("WESM Spot Price Multiplier", 0.5, 3.0, 1.0, 0.1, help="Scale all hourly spot prices")
+    st.session_state["demand_mult"] = st.slider("Demand Scaling Factor", 0.7, 1.5, 1.0, 0.05, help="Scale hourly demand profile")
 
     st.markdown("---")
     st.subheader("🚨 Generator Outages")
-    outages = {}
     for gen in ["GCGI", "FDC", "PEDC", "SPI", "DG1", "DG2"]:
-        outages[gen] = st.checkbox(f"Outage: {gen}", value=False)
+        st.session_state["outages"][gen] = st.checkbox(f"Outage: {gen}", value=st.session_state["outages"].get(gen, False))
 
     st.markdown("---")
     if st.button("🚀 Run Full Optimization", type="primary", use_container_width=True):
@@ -181,41 +193,15 @@ with st.sidebar:
                 st.session_state["data"]["spot"],
             )
             result = optimizer.solve(
-                outages=outages,
-                spot_price_multiplier=spot_mult,
-                demand_multiplier=demand_mult,
+                outages=st.session_state["outages"],
+                spot_price_multiplier=st.session_state["spot_mult"],
+                demand_multiplier=st.session_state["demand_mult"],
             )
             st.session_state["opt_result"] = result
             st.success("Optimization solved successfully!")
         except Exception as e:
             st.error(f"Optimization error: {e}")
 
-# =========================================================
-# CAPELCO BRAND HEADER
-# =========================================================
-if os.path.exists(os.path.join(SCRIPT_DIR, "Logo-CAPELCO.png")):
-    with open(os.path.join(SCRIPT_DIR, "Logo-CAPELCO.png"), "rb") as _logo_file:
-        _logo_b64 = base64.b64encode(_logo_file.read()).decode("utf-8")
-    _logo_html = f'<img class="capelco-logo" src="data:image/png;base64,{_logo_b64}" alt="CAPELCO Logo">'
-else:
-    _logo_html = '<div style="font-size:4rem;">⚡</div>'
-
-st.markdown(
-    f"""
-    <div class="capelco-header">
-        {_logo_html}
-        <div>
-            <div class="capelco-title">CAPELCO</div>
-            <div class="capelco-subtitle">Power Dispatch Optimizer</div>
-        </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-with st.sidebar:
-    st.markdown("### ⚡ CAPELCO")
-    st.caption("Power Dispatch Optimizer")
     st.markdown("---")
     st.markdown("**NAVIGATION**")
     st.markdown("⚡ Dashboard")
@@ -275,7 +261,6 @@ with tab_data:
         "**Demand**, **Generators**, and **SpotMarket**."
     )
 
-    # The template download belongs ONLY to the Data Management tab.
     template_path = os.path.join(SCRIPT_DIR, "CAPELCO_Dispatch_Input_Template.xlsx")
     if os.path.exists(template_path):
         with open(template_path, "rb") as f:
@@ -336,9 +321,7 @@ with tab_data:
                 for sheet, cols in required_columns.items():
                     missing_cols = [c for c in cols if c not in uploaded_tables[sheet].columns]
                     if missing_cols:
-                        column_errors.append(
-                            f"{sheet}: missing {', '.join(missing_cols)}"
-                        )
+                        column_errors.append(f"{sheet}: missing {', '.join(missing_cols)}")
 
                 if column_errors:
                     st.error(
@@ -349,14 +332,10 @@ with tab_data:
                 elif uploaded_demand.empty or uploaded_generators.empty or uploaded_spot.empty:
                     st.error("All three worksheets must contain data.")
                 else:
-                    # Update all three datasets together only after validation succeeds.
                     st.session_state["data"]["demand"] = normalize_hourly_data(uploaded_demand)
                     st.session_state["data"]["generators"] = uploaded_generators.copy()
                     st.session_state["data"]["spot"] = normalize_hourly_data(uploaded_spot)
-
-                    # Prevent an old optimization result from being displayed with new inputs.
                     st.session_state["opt_result"] = None
-
                     st.success(
                         f"Workbook loaded successfully: "
                         f"{len(uploaded_demand):,} demand rows, "
@@ -373,7 +352,6 @@ with tab_data:
                         st.dataframe(uploaded_spot.head(10), use_container_width=True)
         except Exception as e:
             st.error(f"Could not read the Excel workbook: {e}")
-
 
     st.markdown("---")
     st.subheader("📊 Active Data Tables")
@@ -396,9 +374,12 @@ with tab_forecast:
         "to historical load profiles to project 24-hour demand."
     )
 
-    col_f1, col_f2, col_f3 = st.columns(3)
+    if DemandForecaster is None:
+        st.error("The forecast engine is not available. Please ensure `forecast_engine.py` is in the same directory.")
+    else:
+        col_f1, col_f2, col_f3 = st.columns(3)
 
-    with col_f1:
+        with col_f1:
             forecast_horizon = st.slider(
                 "Forecast Horizon (Hours)",
                 min_value=12,
@@ -407,7 +388,7 @@ with tab_forecast:
                 step=12
             )
 
-    with col_f2:
+        with col_f2:
             growth_pct = st.slider(
                 "Expected Load Growth (+%)",
                 min_value=-20.0,
@@ -416,31 +397,24 @@ with tab_forecast:
                 step=1.0
             )
 
-    with col_f3:
+        with col_f3:
             conf_int = st.selectbox(
                 "Prediction Confidence Interval",
                 [0.90, 0.95, 0.99],
                 index=1
             )
 
-    if st.button("🔮 Run Demand Forecast", type="primary"):
+        if st.button("🔮 Run Demand Forecast", type="primary"):
             try:
-                forecaster = DemandForecaster(
-                    st.session_state["data"]["demand"]
-                )
-
+                forecaster = DemandForecaster(st.session_state["data"]["demand"])
                 forecast_df = forecaster.forecast(
                     periods=forecast_horizon,
                     confidence_interval=conf_int,
                     growth_rate_pct=growth_pct,
                 )
-
                 st.session_state["forecast_df"] = forecast_df
 
-                # Plot Forecast
                 fig = go.Figure()
-
-                # Upper confidence bound
                 fig.add_trace(go.Scatter(
                     x=forecast_df["ds"],
                     y=forecast_df["Demand_Upper"],
@@ -449,8 +423,6 @@ with tab_forecast:
                     showlegend=False,
                     name="Upper Bound",
                 ))
-
-                # Lower confidence bound
                 fig.add_trace(go.Scatter(
                     x=forecast_df["ds"],
                     y=forecast_df["Demand_Lower"],
@@ -460,83 +432,68 @@ with tab_forecast:
                     fillcolor="rgba(2, 132, 199, 0.15)",
                     name="Confidence Interval",
                 ))
-
-                # Forecast line
                 fig.add_trace(go.Scatter(
                     x=forecast_df["ds"],
                     y=forecast_df["Demand"],
                     mode="lines+markers",
-                    line=dict(
-                        color="#0284c7",
-                        width=3
-                    ),
+                    line=dict(color="#0284c7", width=3),
                     name="Forecasted Demand (MW)",
                 ))
-
                 fig.update_layout(
-                    title=(
-                        f"Hourly Load Forecast "
-                        f"({forecast_horizon} Hours Ahead)"
-                    ),
+                    title=f"Hourly Load Forecast ({forecast_horizon} Hours Ahead)",
                     xaxis_title="Timestamp",
                     yaxis_title="Demand (MW)",
                     template="plotly_white",
                     hovermode="x unified",
                     height=450,
                 )
+                st.plotly_chart(fig, use_container_width=True)
 
-                st.plotly_chart(
-                    fig,
-                    use_container_width=True
-                )
-
-                # Apply Forecast
                 col_btn1, col_btn2 = st.columns([1, 4])
-
                 with col_btn1:
                     if st.button("⚡ Apply Forecast to Optimizer"):
-                        future_slice = forecast_df[
-                            forecast_df["Is_Forecast"]
-                        ].head(24)
-
+                        future_slice = forecast_df[forecast_df["Is_Forecast"]].head(24)
                         if not future_slice.empty:
-                            new_demand = future_slice[
-                                ["Date", "Hour", "Demand"]
-                            ].reset_index(drop=True)
-
-                            st.session_state["data"]["demand"] = (
-                                normalize_hourly_data(new_demand)
-                            )
-
-                            st.success(
-                                "Demand profile updated with forecast!"
-                            )
+                            new_demand = future_slice[["Date", "Hour", "Demand"]].reset_index(drop=True)
+                            st.session_state["data"]["demand"] = normalize_hourly_data(new_demand)
+                            st.session_state["opt_result"] = None
+                            st.success("Demand profile updated with forecast!")
                         else:
-                            st.warning(
-                                "No forecasted hours are available to apply."
-                            )
-
+                            st.warning("No forecasted hours are available to apply.")
             except Exception as e:
-                st.error(
-                    f"Forecasting failed: {e}"
-                )
+                st.error(f"Forecasting failed: {e}")
 
 # =========================================================
 # TAB 3: OPTIMAL DISPATCH
 # =========================================================
 with tab_dispatch:
+    # Ensure we have an optimization result; if not, run default
     if st.session_state["opt_result"] is None:
-        # Run default solve if not yet run
         optimizer = DispatchOptimizer(
             st.session_state["data"]["demand"],
             st.session_state["data"]["generators"],
             st.session_state["data"]["spot"],
         )
-        st.session_state["opt_result"] = optimizer.solve(outages=outages, spot_price_multiplier=spot_mult, demand_multiplier=demand_mult)
+        st.session_state["opt_result"] = optimizer.solve(
+            outages=st.session_state["outages"],
+            spot_price_multiplier=st.session_state["spot_mult"],
+            demand_multiplier=st.session_state["demand_mult"],
+        )
 
     res: OptimizationResult = st.session_state["opt_result"]
 
-    # Top KPI Metrics Cards
+    # Backward-compatible attributes (if older result)
+    if not hasattr(res, "generator_rate_php_kwh"):
+        _m = res.generator_metrics_df
+        _gm = _m[_m["Generator"] != "Spot Market"]
+        res.generator_energy_mwh = float(_gm["Energy Dispatched (MWh)"].sum())
+        res.generator_cost_kphp = float(_gm["Total Cost (kPHP)"].sum())
+        res.generator_rate_php_kwh = (
+            res.generator_cost_kphp * 1000 / res.generator_energy_mwh
+            if res.generator_energy_mwh > 0 else 0.0
+        )
+
+    # Top KPI Cards
     kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
     with kpi1:
         st.markdown(f"""
@@ -581,9 +538,8 @@ with tab_dispatch:
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # Interactive Generation Stack Plotly Chart
+    # Stacked Bar Chart
     st.subheader("⚡ Hourly Generation Dispatch Stack vs Demand")
-    
     df_disp = res.dispatch_df
     fig_stack = go.Figure()
 
@@ -592,8 +548,8 @@ with tab_dispatch:
         ("FDC_MW", "FDC (4 MW Fixed)"),
         ("PEDC_MW", "PEDC (4/8 MW Flexible)"),
         ("SPI_MW", "SPI (0-8 MW)"),
-        ("DG1_MW", "DG1 Peaker (3.1 MW)"),
-        ("DG2_MW", "DG2 Peaker (3.8 MW)"),
+        ("DG1_MW", "DG Plant - Unit 1 (3.1 MW)"),
+        ("DG2_MW", "DG Plant - Unit 2 (3.8 MW)"),
         ("Spot_MW", "WESM Spot Market"),
     ]
 
@@ -605,7 +561,6 @@ with tab_dispatch:
             marker_color=GEN_COLORS[col],
         ))
 
-    # Add Demand Line
     fig_stack.add_trace(go.Scatter(
         x=df_disp["Hour"],
         y=df_disp["Demand_MW"],
@@ -627,128 +582,76 @@ with tab_dispatch:
     )
     st.plotly_chart(fig_stack, use_container_width=True)
 
-    # Detailed Generator Contribution Table
-    st.subheader("📋 Generator Dispatch Summary & Contract Verification")
-    st.dataframe(
-        res.generator_metrics_df.style.format({
-            "Energy Dispatched (MWh)": lambda x: f"{x:,.2f}" if pd.notnull(x) and isinstance(x, (int, float)) else str(x),
-            "Energy Share (%)": lambda x: f"{x:.1f}%" if pd.notnull(x) and isinstance(x, (int, float)) else str(x),
-            "Total Cost (kPHP)": lambda x: f"PHP {x:,.2f}k" if pd.notnull(x) and isinstance(x, (int, float)) else str(x),
-            "Effective Rate (PHP/kWh)": lambda x: f"PHP {x:.4f}" if pd.notnull(x) and isinstance(x, (int, float)) else str(x),
-            "Capacity Factor (CUF %)": lambda x: f"{x:.1f}%" if pd.notnull(x) and isinstance(x, (int, float)) else "-",
-        }, na_rep="-"),
-        use_container_width=True,
+    # Generator-only rate
+    st.markdown("### 💰 Generator-Only Cost & Rate")
+    gr1, gr2, gr3 = st.columns(3)
+    with gr1:
+        st.metric("Generator Energy", f"{res.generator_energy_mwh:,.2f} MWh")
+    with gr2:
+        st.metric("Generator Cost", f"₱{res.generator_cost_kphp:,.2f}k")
+    with gr3:
+        st.metric("Generator Rate (Excl. WESM)", f"₱{res.generator_rate_php_kwh:.4f}/kWh")
+
+    st.caption(
+        "Generator Rate = total GCGI + FDC + PEDC + SPI + DG Plant cost ÷ "
+        "their total dispatched energy. WESM/Spot Market is excluded."
     )
 
-    # Daily Generator Totals & Contract Constraint Verification
+    # Generator Metrics Table
+    st.subheader("📋 Generator Dispatch Summary & Contract Verification")
+    st.caption("DG1 and DG2 are shown physically by unit, but their energy cost is consolidated as one DG Plant cost using one plant price.")
+    metrics_display = res.generator_metrics_df.copy()
+
+    preferred_order = [
+        "GCGI", "FDC", "PEDC", "SPI", "DG Plant (DG1+DG2)", "Spot Market"
+    ]
+    metrics_display["Generator"] = pd.Categorical(
+        metrics_display["Generator"],
+        categories=preferred_order,
+        ordered=True,
+    )
+    metrics_display = metrics_display.sort_values("Generator").copy()
+    metrics_display["Generator"] = metrics_display["Generator"].astype(str)
+
+    st.dataframe(
+        metrics_display.style.format({
+            "Capacity (MW)": lambda x: f"{x:,.1f}" if isinstance(x, (int, float)) else str(x),
+            "Contract Price (PHP/kWh)": lambda x: f"₱{float(x):.4f}" if isinstance(x, (int, float)) else str(x),
+            "Energy Dispatched (MWh)": lambda x: f"{x:,.2f}" if isinstance(x, (int, float)) else str(x),
+            "Energy Share (%)": lambda x: f"{x:.2f}%" if isinstance(x, (int, float)) else str(x),
+            "Total Cost (kPHP)": lambda x: f"₱{x:,.2f}k" if isinstance(x, (int, float)) else str(x),
+            "Effective Rate (PHP/kWh)": lambda x: f"₱{x:.4f}" if isinstance(x, (int, float)) else str(x),
+            "Capacity Factor (CUF %)": lambda x: f"{x:.2f}%" if isinstance(x, (int, float)) else "-",
+        }, na_rep="-"),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    # Constraint Verification (using optimizer-generated table)
     st.subheader("✅ Daily Generator Totals & Constraint Verification")
     st.caption(
         "Daily totals are calculated directly from the solved dispatch. "
-        "SPI nominations are whole MW. PEDC is 4/8 MW. DG1/DG2 are 0-or-full capacity."
+        "SPI nominations are whole MW. PEDC is 4/8 MW. DG1 and DG2 are one power plant: one plant price is applied to their combined output."
     )
 
-    # Build a dashboard-side verification table so it remains visible even if
-    # an older optimizer_engine.py is accidentally still being used.
-    dispatch_check = res.dispatch_df.copy()
-    gen_specs = [
-        ("GCGI", "GCGI_MW", "Must run at available capacity"),
-        ("FDC", "FDC_MW", "Fixed output"),
-        ("PEDC", "PEDC_MW", "Hourly 4/8 MW; daily minimum 153.6 MWh"),
-        ("SPI", "SPI_MW", "Whole MW hourly; daily minimum 144 MWh"),
-        ("DG1", "DG1_MW", "0 or full capacity (3.1 MW)"),
-        ("DG2", "DG2_MW", "0 or full capacity (3.8 MW)"),
-        ("Spot Market", "Spot_MW", "Continuous balancing purchase"),
-    ]
+    constraint_view = res.constraint_check_df.copy()
 
-    check_rows = []
-    for date, day_df in dispatch_check.groupby("Date", sort=True):
-        hours = len(day_df)
-        for name, col, rule in gen_specs:
-            total = float(day_df[col].sum()) if col in day_df.columns else 0.0
-            minimum = 0.0
-            maximum = None
-            status = "INFO"
-
-            if name == "GCGI":
-                cap = float(day_df[col].max())
-                minimum = maximum = cap * hours
-                status = "PASS" if abs(total - minimum) < 1e-6 else "FAIL"
-            elif name == "FDC":
-                cap = float(day_df[col].max())
-                minimum = maximum = cap * hours
-                status = "PASS" if abs(total - minimum) < 1e-6 else "FAIL"
-            elif name == "PEDC":
-                minimum = min(153.6 * hours / 24.0, 8.0 * hours * 0.8)
-                maximum = 8.0 * hours
-                hourly_ok = day_df[col].apply(lambda x: abs(float(x) - 4) < 1e-6 or abs(float(x) - 8) < 1e-6).all()
-                status = "PASS" if hourly_ok and total + 1e-6 >= minimum else "FAIL"
-            elif name == "SPI":
-                minimum = min(144.0 * hours / 24.0, 8.0 * hours * 0.75)
-                maximum = 8.0 * hours
-                integer_ok = day_df[col].apply(lambda x: abs(float(x) - round(float(x))) < 1e-6).all()
-                within_cap = bool((day_df[col] >= -1e-6).all() and (day_df[col] <= 8.0 + 1e-6).all())
-                status = "PASS" if integer_ok and within_cap and total + 1e-6 >= minimum else "FAIL"
-            elif name == "DG1":
-                cap = 3.1
-                maximum = cap * hours
-                hourly_ok = day_df[col].apply(lambda x: abs(float(x)) < 1e-6 or abs(float(x) - cap) < 1e-6).all()
-                status = "PASS" if hourly_ok else "FAIL"
-            elif name == "DG2":
-                cap = 3.8
-                maximum = cap * hours
-                hourly_ok = day_df[col].apply(lambda x: abs(float(x)) < 1e-6 or abs(float(x) - cap) < 1e-6).all()
-                status = "PASS" if hourly_ok else "FAIL"
-
-            check_rows.append({
-                "Date": date,
-                "Generator": name,
-                "Daily Total (MWh)": total,
-                "Minimum (MWh)": minimum,
-                "Maximum (MWh)": maximum,
-                "Constraint": rule,
-                "Status": status,
-            })
-
-    constraint_view = pd.DataFrame(check_rows)
-
-    # Readable constraint table: explicit dark text + compact columns so the
-    # table remains legible in Streamlit dark mode.
     def _constraint_row_style(row):
         status = row["Status"]
         if status == "PASS":
-            bg = "#dcfce7"
-            fg = "#166534"
+            bg = "#dcfce7"; fg = "#166534"
         elif status == "FAIL":
-            bg = "#fee2e2"
-            fg = "#991b1b"
+            bg = "#fee2e2"; fg = "#991b1b"
         else:
-            bg = "#f3f4f6"
-            fg = "#374151"
-        return [
-            f"background-color: {bg}; color: {fg}; font-weight: 500;"
-            for _ in row
-        ]
+            bg = "#f3f4f6"; fg = "#374151"
+        return [f"background-color: {bg}; color: {fg}; font-weight: 500;" for _ in row]
 
     constraint_style = (
         constraint_view.style
         .apply(_constraint_row_style, axis=1)
-        .set_properties(**{
-            "color": "#111827",
-            "background-color": "#ffffff",
-            "font-size": "14px",
-            "padding": "7px 10px",
-        })
-        .set_table_styles([
-            {
-                "selector": "th",
-                "props": [
-                    ("background-color", "#e5e7eb"),
-                    ("color", "#111827"),
-                    ("font-weight", "700"),
-                    ("font-size", "13px"),
-                ],
-            },
-        ])
+        .set_properties(**{"color": "#111827", "background-color": "#ffffff", "font-size": "14px", "padding": "7px 10px"})
+        .set_table_styles([{"selector": "th", "props": [("background-color", "#e5e7eb"), ("color", "#111827"),
+                                                        ("font-weight", "700"), ("font-size", "13px")]}])
         .format({
             "Daily Total (MWh)": "{:.0f}",
             "Minimum (MWh)": lambda x: f"{x:.1f}" if pd.notnull(x) else "—",
@@ -780,60 +683,27 @@ with tab_dispatch:
 
     # Detailed Hourly Schedule Expandable
     with st.expander("🔍 View Full 24-Hour Dispatch & Cost Schedule"):
-
-    # Make sure both Date columns use the same datetime type
-        res.dispatch_df["Date"] = pd.to_datetime(
-            res.dispatch_df["Date"],
-             errors="coerce"
-        )
-
-        res.hourly_cost_df["Date"] = pd.to_datetime(
-            res.hourly_cost_df["Date"],
-            errors="coerce"
-        )
-
+        # Merge dispatch and cost data
         merged_schedule = pd.merge(
             res.dispatch_df,
-            res.hourly_cost_df[
-                ["Date", "Hour", "Total_Cost_kPHP", "Blended_Rate_PHP_kWh"]
-            ],
+            res.hourly_cost_df[["Date", "Hour", "Total_Cost_PHP", "Blended_Rate_PHP_kWh"]],
             on=["Date", "Hour"],
             how="left"
         )
+        # Rename for clarity
+        merged_schedule.rename(columns={"Total_Cost_PHP": "Total_Cost_PHP"}, inplace=True)
 
-        num_cols = [
-            col for col in merged_schedule.columns
-            if col not in ["Date", "Hour"]
-        ]
+        num_cols = [col for col in merged_schedule.columns if col not in ["Date", "Hour"]]
+        generator_mw_cols = [c for c in ["GCGI_MW", "FDC_MW", "PEDC_MW", "SPI_MW", "DG_Plant_MW", "DG1_MW", "DG2_MW"] if c in merged_schedule.columns]
 
-        # Generator nominations are whole MW in the optimization engine.
-        generator_mw_cols = [
-            c for c in [
-                "GCGI_MW", "FDC_MW", "PEDC_MW", "SPI_MW", "DG1_MW", "DG2_MW"
-            ] if c in merged_schedule.columns
-        ]
-
-        formatters = {
-            col: (
-                lambda x: f"{x:.0f}"
-                if isinstance(x, (int, float, np.integer, np.floating))
-                else str(x)
-            )
-            for col in generator_mw_cols
-        }
-
+        formatters = {}
+        for col in generator_mw_cols:
+            formatters[col] = lambda x: f"{x:.0f}" if isinstance(x, (int, float)) else str(x)
         for col in num_cols:
             if col not in formatters:
-                formatters[col] = (
-                    lambda x: f"{x:.2f}"
-                    if isinstance(x, (int, float, np.integer, np.floating))
-                    else str(x)
-                )
+                formatters[col] = lambda x: f"{x:.2f}" if isinstance(x, (int, float)) else str(x)
 
-        st.dataframe(
-            merged_schedule.style.format(formatters),
-            use_container_width=True
-        )
+        st.dataframe(merged_schedule.style.format(formatters), use_container_width=True)
 
 # =========================================================
 # TAB 4: SCENARIO ANALYSIS
@@ -900,7 +770,6 @@ with tab_scenario:
 
         col_sc1, col_sc2 = st.columns(2)
         with col_sc1:
-            # Comparative Rate Chart
             fig_sc1 = px.bar(
                 sc_df,
                 x="Scenario",
@@ -914,7 +783,6 @@ with tab_scenario:
             st.plotly_chart(fig_sc1, use_container_width=True)
 
         with col_sc2:
-            # Cost Impact Delta Chart
             fig_sc2 = px.bar(
                 sc_df,
                 x="Scenario",
@@ -933,7 +801,12 @@ with tab_scenario:
 with tab_analytics:
     st.subheader("📊 Visual Analytics & Economic Merit Order")
 
-    if res is not None:
+    # Ensure we have a result
+    if st.session_state["opt_result"] is None:
+        st.info("No optimization result found. Please run the optimizer first (Dispatch tab or sidebar).")
+    else:
+        res = st.session_state["opt_result"]
+
         col_an1, col_an2 = st.columns(2)
         with col_an1:
             # Generation Mix Donut
@@ -972,46 +845,41 @@ with tab_analytics:
             fig_c_pie.update_layout(template="plotly_white", height=400)
             st.plotly_chart(fig_c_pie, use_container_width=True)
 
-    # Merge spot data aligned with hourly cost df
-    hourly_cost_plot = normalize_hourly_data(res.hourly_cost_df)
-    spot_plot = normalize_hourly_data(
-        st.session_state["data"]["spot"]
-    )
+        # Hourly Spot Price vs Blended Rate
+        hourly_cost_plot = normalize_hourly_data(res.hourly_cost_df)
+        spot_plot = normalize_hourly_data(st.session_state["data"]["spot"])
+        spot_merged = pd.merge(
+            hourly_cost_plot,
+            spot_plot[["Date", "Hour", "SpotPrice"]],
+            on=["Date", "Hour"],
+            how="left"
+        )
+        spot_merged["EffectiveSpotPrice"] = spot_merged["SpotPrice"] * st.session_state["spot_mult"]
 
-    spot_merged = pd.merge(
-        hourly_cost_plot,
-        spot_plot[["Date", "Hour", "SpotPrice"]],
-        on=["Date", "Hour"],
-        how="left"
-    )
-
-    spot_merged["EffectiveSpotPrice"] = spot_merged["SpotPrice"] * spot_mult
-
-    # Hourly Spot Price vs Blended Rate Curve
-    fig_rate = go.Figure()
-    fig_rate.add_trace(go.Scatter(
-        x=spot_merged["Hour"],
-        y=spot_merged["EffectiveSpotPrice"],
-        mode="lines+markers",
-        name="WESM Spot Price (PHP/kWh)",
-        line=dict(color="#ef4444", width=2, dash="dot"),
-    ))
-    fig_rate.add_trace(go.Scatter(
-        x=spot_merged["Hour"],
-        y=spot_merged["Blended_Rate_PHP_kWh"],
-        mode="lines+markers",
-        name="Blended Dispatch Rate (PHP/kWh)",
-        line=dict(color="#0284c7", width=3),
-    ))
-    fig_rate.update_layout(
-        title="Hourly WESM Spot Price vs CAPELCO Blended Rate",
-        xaxis=dict(title="Hour of Day (0 - 23)", tickmode="linear", tick0=0, dtick=1),
-        yaxis=dict(title="Rate (PHP/kWh)"),
-        template="plotly_white",
-        hovermode="x unified",
-        height=420,
-    )
-    st.plotly_chart(fig_rate, use_container_width=True)
+        fig_rate = go.Figure()
+        fig_rate.add_trace(go.Scatter(
+            x=spot_merged["Hour"],
+            y=spot_merged["EffectiveSpotPrice"],
+            mode="lines+markers",
+            name="WESM Spot Price (PHP/kWh)",
+            line=dict(color="#ef4444", width=2, dash="dot"),
+        ))
+        fig_rate.add_trace(go.Scatter(
+            x=spot_merged["Hour"],
+            y=spot_merged["Blended_Rate_PHP_kWh"],
+            mode="lines+markers",
+            name="Blended Dispatch Rate (PHP/kWh)",
+            line=dict(color="#0284c7", width=3),
+        ))
+        fig_rate.update_layout(
+            title="Hourly WESM Spot Price vs CAPELCO Blended Rate",
+            xaxis=dict(title="Hour of Day (0 - 23)", tickmode="linear", tick0=0, dtick=1),
+            yaxis=dict(title="Rate (PHP/kWh)"),
+            template="plotly_white",
+            hovermode="x unified",
+            height=420,
+        )
+        st.plotly_chart(fig_rate, use_container_width=True)
 
 # =========================================================
 # TAB 6: REPORTS & EXPORT
@@ -1020,10 +888,14 @@ with tab_reports:
     st.subheader("📑 Reports & Data Export")
     st.markdown("Generate board-ready executive summaries and download complete dispatch schedules.")
 
-    if res is not None:
+    if st.session_state["opt_result"] is None:
+        st.info("No optimization result available. Please run the optimizer first.")
+    else:
+        res = st.session_state["opt_result"]
+
         col_exp1, col_exp2 = st.columns(2)
         
-        # Excel Workbook Export
+        # Excel Export
         output_buffer = io.BytesIO()
         with pd.ExcelWriter(output_buffer, engine="openpyxl") as writer:
             res.dispatch_df.to_excel(writer, sheet_name="Hourly Dispatch", index=False)
@@ -1060,10 +932,9 @@ with tab_reports:
         #### **CAPELCO POWER SUPPLY DISPATCH REPORT**
         * **Operational Date**: `{res.dispatch_df['Date'].iloc[0]}`
         * **Total Energy Procured**: **{res.total_demand_mwh:,.2f} MWh**
-        * **Total Procurement Cost**: **PHP {res.total_cost_kphp:,.2f} kPHP** (₱{res.total_cost_kphp*1000:,.2f})
+        * **Total Procurement Cost**: **PHP {res.total_cost_kphp * 1000:,.2f}** (₱{res.total_cost_kphp:,.2f} k)
         * **Weighted Blended Rate**: **PHP {res.blended_rate_php_kwh:.4f} / kWh**
         * **WESM Spot Market Share**: **{res.spot_energy_mwh:,.2f} MWh ({res.spot_share_pct:.2f}%)**
         * **Baseload & Contract Energy**: **{(res.total_demand_mwh - res.spot_energy_mwh):,.2f} MWh ({(100 - res.spot_share_pct):.2f}%)**
         * **Generator Constraint Checks**: **{"PASS" if constraint_failures == 0 else f"{constraint_failures} FAIL"}**
         """)
-
